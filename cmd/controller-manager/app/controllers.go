@@ -23,6 +23,8 @@ import (
 	"kubesphere.io/kubesphere/pkg/controller/cluster"
 	"kubesphere.io/kubesphere/pkg/controller/destinationrule"
 	"kubesphere.io/kubesphere/pkg/controller/job"
+	"kubesphere.io/kubesphere/pkg/controller/network/nsnetworkpolicy"
+	"kubesphere.io/kubesphere/pkg/controller/network/provider"
 	"kubesphere.io/kubesphere/pkg/controller/s2ibinary"
 	"kubesphere.io/kubesphere/pkg/controller/s2irun"
 	"kubesphere.io/kubesphere/pkg/controller/storage/expansion"
@@ -101,6 +103,17 @@ func AddControllers(
 		client.KubeSphere().ClusterV1alpha1().Agents(),
 		client.KubeSphere().ClusterV1alpha1().Clusters())
 
+	k8sProvider, err := provider.NewK8sNetworkProvider(client.Kubernetes(),
+		kubernetesInformer.Networking().V1().NetworkPolicies())
+	if err != nil {
+		return err
+	}
+	nsnpController := nsnetworkpolicy.NewnamespacenpController(client.Kubernetes(),
+		client.KubeSphere().NetworkV1alpha1(), kubesphereInformer.Network().V1alpha1().NamespaceNetworkPolicies(),
+		kubernetesInformer.Core().V1().Services(), kubesphereInformer.Tenant().V1alpha1().Workspaces(),
+		kubernetesInformer.Core().V1().Namespaces(), k8sProvider)
+	nsnetworkpolicy.RegisterWebhooks(mgr)
+
 	controllers := map[string]manager.Runnable{
 		"virtualservice-controller":  vsController,
 		"destinationrule-controller": drController,
@@ -111,6 +124,7 @@ func AddControllers(
 		"volumeexpansion-controller": volumeExpansionController,
 		"user-controller":            userController,
 		"cluster-controller":         clusterController,
+		"nsnp-controller":            nsnpController,
 	}
 
 	for name, ctrl := range controllers {

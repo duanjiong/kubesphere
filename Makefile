@@ -49,6 +49,10 @@ ks-apiserver: fmt vet
 controller-manager: fmt vet
 	hack/gobuild.sh cmd/controller-manager
 
+#Build ks-network binary
+ks-network: fmt vet
+	hack/gobuild.sh cmd/ks-network
+
 # Build hypersphere binary
 hypersphere: fmt vet
 	hack/gobuild.sh cmd/hypersphere
@@ -115,12 +119,12 @@ internal-generate-apis: internal-controller-gen
 	$(CONTROLLER_GEN) object:headerFile=./hack/boilerplate.go.txt paths=./pkg/apis/network/...
 
 internal-controller-gen:
-ifeq (, $(shell which controller-gen))
-	go get sigs.k8s.io/controller-tools/cmd/controller-gen@v0.2.0-beta.4
-CONTROLLER_GEN=$(GOBIN)/controller-gen
-else
-CONTROLLER_GEN=$(shell which controller-gen)
-endif
+	ifeq (, $(shell which controller-gen))
+		go get sigs.k8s.io/controller-tools/cmd/controller-gen@v0.2.0-beta.4
+	CONTROLLER_GEN=$(GOBIN)/controller-gen
+	else
+	CONTROLLER_GEN=$(shell which controller-gen)
+	endif
 
 network-rbac:
 	$(CONTROLLER_GEN) paths=./pkg/controller/network/provider/ paths=./pkg/controller/network/ rbac:roleName=network-manager output:rbac:artifacts:config=kustomize/network/calico-k8s

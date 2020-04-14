@@ -1,66 +1,48 @@
 package provider
 
 import (
-	"reflect"
-
-	"github.com/projectcalico/libcalico-go/lib/errors"
-	"k8s.io/client-go/tools/cache"
-	api "kubesphere.io/kubesphere/pkg/apis/network/v1alpha1"
+	"fmt"
+	"github.com/projectcalico/kube-controllers/pkg/converter"
+	api "github.com/projectcalico/libcalico-go/lib/apis/v3"
+	constants "github.com/projectcalico/libcalico-go/lib/backend/k8s/conversion"
+	"k8s.io/api/networking/v1"
 )
 
-func NewFakeCalicoNetworkProvider() *FakeCalicoNetworkProvider {
-	f := new(FakeCalicoNetworkProvider)
-	f.NSNPData = make(map[string]*api.NamespaceNetworkPolicy)
+func NewFakeNetworkProvider() *FakeNetworkProvider {
+	f := new(FakeNetworkProvider)
+	f.NSNPData = make(map[string]*api.NetworkPolicy)
+	f.policyConverter = converter.NewPolicyConverter()
 	return f
 }
 
-type FakeCalicoNetworkProvider struct {
-	NSNPData map[string]*api.NamespaceNetworkPolicy
+type FakeNetworkProvider struct {
+	NSNPData        map[string]*api.NetworkPolicy
+	policyConverter converter.Converter
 }
 
-func (f *FakeCalicoNetworkProvider) Get(o *api.NamespaceNetworkPolicy) (interface{}, error) {
-	namespacename, _ := cache.MetaNamespaceKeyFunc(o)
-	obj, ok := f.NSNPData[namespacename]
-	if !ok {
-		return nil, errors.ErrorResourceDoesNotExist{}
-	}
-	return obj, nil
+func (f *FakeNetworkProvider) Delete(key string) {
+	delete(f.NSNPData, key)
 }
 
-func (f *FakeCalicoNetworkProvider) Add(o *api.NamespaceNetworkPolicy) error {
-	namespacename, _ := cache.MetaNamespaceKeyFunc(o)
-	if _, ok := f.NSNPData[namespacename]; ok {
-		return errors.ErrorResourceAlreadyExists{}
+func (f *FakeNetworkProvider) Start(stopCh chan struct{}) {
+
+}
+
+func (f *FakeNetworkProvider) Set(np *v1.NetworkPolicy) error {
+	policy, err := f.policyConverter.Convert(np)
+	if err != nil {
+		return err
 	}
-	f.NSNPData[namespacename] = o
+
+	// Add to cache.
+	k := f.policyConverter.GetKey(policy)
+	tmp := policy.(api.NetworkPolicy)
+	f.NSNPData[k] = &tmp
+
 	return nil
 }
 
-func (f *FakeCalicoNetworkProvider) CheckExist(o *api.NamespaceNetworkPolicy) (bool, error) {
-	namespacename, _ := cache.MetaNamespaceKeyFunc(o)
-	if _, ok := f.NSNPData[namespacename]; ok {
-		return true, nil
-	}
-	return false, nil
-}
-
-func (f *FakeCalicoNetworkProvider) NeedUpdate(o *api.NamespaceNetworkPolicy) (bool, error) {
-	namespacename, _ := cache.MetaNamespaceKeyFunc(o)
-	store := f.NSNPData[namespacename]
-	if !reflect.DeepEqual(store, o) {
-		return true, nil
-	}
-	return false, nil
-}
-
-func (f *FakeCalicoNetworkProvider) Update(o *api.NamespaceNetworkPolicy) error {
-	namespacename, _ := cache.MetaNamespaceKeyFunc(o)
-	f.NSNPData[namespacename] = o
-	return nil
-}
-
-func (f *FakeCalicoNetworkProvider) Delete(o *api.NamespaceNetworkPolicy) error {
-	namespacename, _ := cache.MetaNamespaceKeyFunc(o)
-	delete(f.NSNPData, namespacename)
-	return nil
+func (f *FakeNetworkProvider) GetKey(name, nsname string) string {
+	policyName := fmt.Sprintf(constants.K8sNetworkPolicyNamePrefix + name)
+	return fmt.Sprintf("%s/%s", nsname, policyName)
 }

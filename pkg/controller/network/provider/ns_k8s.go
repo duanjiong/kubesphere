@@ -4,99 +4,56 @@ import (
 	"context"
 	"fmt"
 	rcache "github.com/projectcalico/kube-controllers/pkg/cache"
-	"github.com/projectcalico/kube-controllers/pkg/converter"
-	api "github.com/projectcalico/libcalico-go/lib/apis/v3"
-	constants "github.com/projectcalico/libcalico-go/lib/backend/k8s/conversion"
-	kdd "github.com/projectcalico/libcalico-go/lib/backend/k8s/conversion"
-	client "github.com/projectcalico/libcalico-go/lib/clientv3"
-	"github.com/projectcalico/libcalico-go/lib/errors"
-	"github.com/projectcalico/libcalico-go/lib/options"
 	netv1 "k8s.io/api/networking/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	uruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
+	informerv1 "k8s.io/client-go/informers/networking/v1"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/klog"
 	"reflect"
 	"strings"
 	"time"
 )
 
-func (c *policyController) GetKey(name, nsname string) string {
-	policyName := fmt.Sprintf(constants.K8sNetworkPolicyNamePrefix + name)
-	return fmt.Sprintf("%s/%s", nsname, policyName)
+func (c *k8sPolicyController) GetKey(name, nsname string) string {
+	return fmt.Sprintf("%s/%s", nsname, name)
+}
+
+func getkey(key string) (string, string) {
+	strs := strings.Split(key, "/")
+	return strs[0], strs[1]
 }
 
 // policyController implements the Controller interface for managing Kubernetes network policies
 // and syncing them to the Calico datastore as NetworkPolicies.
-type policyController struct {
-	resourceCache   rcache.ResourceCache
-	calicoClient    client.Interface
-	ctx             context.Context
-	policyConverter converter.Converter
+type k8sPolicyController struct {
+	client        kubernetes.Interface
+	informer      informerv1.NetworkPolicyInformer
+	ctx           context.Context
+	resourceCache rcache.ResourceCache
 }
 
-// NewPolicyController returns a controller which manages NetworkPolicy objects.
-func newPolicyController(ctx context.Context, c client.Interface) *policyController {
-	policyConverter := converter.NewPolicyConverter()
-
-	// Function returns map of policyName:policy stored by policy controller
-	// in datastore.
-	listFunc := func() (map[string]interface{}, error) {
-		// Get all policies from datastore
-		calicoPolicies, err := c.NetworkPolicies().List(ctx, options.ListOptions{})
-		if err != nil {
-			return nil, err
-		}
-
-		// Filter in only objects that are written by policy controller.
-		m := make(map[string]interface{})
-		for _, policy := range calicoPolicies.Items {
-			if strings.HasPrefix(policy.Name, kdd.K8sNetworkPolicyNamePrefix) {
-				// Update the network policy's ObjectMeta so that it simply contains the name and namespace.
-				// There is other metadata that we might receive (like resource version) that we don't want to
-				// compare in the cache.
-				policy.ObjectMeta = metav1.ObjectMeta{Name: policy.Name, Namespace: policy.Namespace}
-				k := policyConverter.GetKey(policy)
-				m[k] = policy
-			}
-		}
-
-		klog.V(4).Infof("Found %d policies in Calico datastore:", len(m))
-		return m, nil
-	}
-
-	cacheArgs := rcache.ResourceCacheArgs{
-		ListFunc:   listFunc,
-		ObjectType: reflect.TypeOf(api.NetworkPolicy{}),
-	}
-	ccache := rcache.NewResourceCache(cacheArgs)
-
-	return &policyController{ccache, c, ctx, converter.NewPolicyConverter()}
-}
-
-func (c *policyController) Start(stopCh chan struct{}) {
+func (c *k8sPolicyController) Start(stopCh chan struct{}) {
 	c.run(5, "5m", stopCh)
 }
 
-func (c *policyController) Set(np *netv1.NetworkPolicy) error {
-	policy, err := c.policyConverter.Convert(np)
-	if err != nil {
-		return err
-	}
-
+func (c *k8sPolicyController) Set(np *netv1.NetworkPolicy) error {
 	// Add to cache.
-	k := c.policyConverter.GetKey(policy)
-	c.resourceCache.Set(k, policy)
+	k := c.GetKey(np.Name, np.Namespace)
+	c.resourceCache.Set(k, *np)
 
 	return nil
 }
 
-func (c *policyController) Delete(key string) {
+func (c *k8sPolicyController) Delete(key string) {
 	c.resourceCache.Delete(key)
 }
 
 // Run starts the controller.
-func (c *policyController) run(threadiness int, reconcilerPeriod string, stopCh chan struct{}) {
+func (c *k8sPolicyController) run(threadiness int, reconcilerPeriod string, stopCh chan struct{}) {
 	defer uruntime.HandleCrash()
 
 	// Let the workers stop when we are done
@@ -119,14 +76,14 @@ func (c *policyController) run(threadiness int, reconcilerPeriod string, stopCh 
 	klog.Info("Stopping NetworkPolicy controller")
 }
 
-func (c *policyController) runWorker() {
+func (c *k8sPolicyController) runWorker() {
 	for c.processNextItem() {
 	}
 }
 
 // processNextItem waits for an event on the output queue from the resource cache and syncs
 // any received keys to the datastore.
-func (c *policyController) processNextItem() bool {
+func (c *k8sPolicyController) processNextItem() bool {
 	// Wait until there is a new item in the work queue.
 	workqueue := c.resourceCache.GetQueue()
 	key, quit := workqueue.Get()
@@ -149,34 +106,33 @@ func (c *policyController) processNextItem() bool {
 // find the corresponding resource within the resource cache. If the resource for the provided key
 // exists in the cache, then the value should be written to the datastore. If it does not exist
 // in the cache, then it should be deleted from the datastore.
-func (c *policyController) syncToDatastore(key string) error {
+func (c *k8sPolicyController) syncToDatastore(key string) error {
 	// Check if it exists in the controller's cache.
 	obj, exists := c.resourceCache.Get(key)
 	if !exists {
 		// The object no longer exists - delete from the datastore.
 		klog.Infof("Deleting NetworkPolicy %s from Calico datastore", key)
-		ns, name := converter.NewPolicyConverter().DeleteArgsFromKey(key)
-		_, err := c.calicoClient.NetworkPolicies().Delete(c.ctx, ns, name, options.DeleteOptions{})
-		if _, ok := err.(errors.ErrorResourceDoesNotExist); !ok {
-			// We hit an error other than "does not exist".
-			return err
+		ns, name := getkey(key)
+		err := c.client.NetworkingV1().NetworkPolicies(ns).Delete(name, nil)
+		if errors.IsNotFound(err) {
+			return nil
 		}
-		return nil
+		return err
 	} else {
 		// The object exists - update the datastore to reflect.
 		klog.Infof("Create/Update NetworkPolicy %s in Calico datastore", key)
-		p := obj.(api.NetworkPolicy)
+		p := obj.(netv1.NetworkPolicy)
 
 		// Lookup to see if this object already exists in the datastore.
-		gp, err := c.calicoClient.NetworkPolicies().Get(c.ctx, p.Namespace, p.Name, options.GetOptions{})
+		gp, err := c.informer.Lister().NetworkPolicies(p.Namespace).Get(p.Name)
 		if err != nil {
-			if _, ok := err.(errors.ErrorResourceDoesNotExist); !ok {
+			if !errors.IsNotFound(err) {
 				klog.Warningf("Failed to get network policy %s from datastore", key)
 				return err
 			}
 
 			// Doesn't exist - create it.
-			_, err := c.calicoClient.NetworkPolicies().Create(c.ctx, &p, options.SetOptions{})
+			_, err := c.client.NetworkingV1().NetworkPolicies(p.Namespace).Create(&p)
 			if err != nil {
 				klog.Warningf("Failed to create network policy %s", key)
 				return err
@@ -187,7 +143,7 @@ func (c *policyController) syncToDatastore(key string) error {
 
 		// The policy already exists, update it and write it back to the datastore.
 		gp.Spec = p.Spec
-		_, err = c.calicoClient.NetworkPolicies().Update(c.ctx, gp, options.SetOptions{})
+		_, err = c.client.NetworkingV1().NetworkPolicies(p.Namespace).Update(gp)
 		if err != nil {
 			klog.Warningf("Failed to update network policy %s", key)
 			return err
@@ -200,7 +156,7 @@ func (c *policyController) syncToDatastore(key string) error {
 // handleErr handles errors which occur while processing a key received from the resource cache.
 // For a given error, we will re-queue the key in order to retry the datastore sync up to 5 times,
 // at which point the update is dropped.
-func (c *policyController) handleErr(err error, key string) {
+func (c *k8sPolicyController) handleErr(err error, key string) {
 	workqueue := c.resourceCache.GetQueue()
 	if err == nil {
 		// Forget about the #AddRateLimited history of the key on every successful synchronization.
@@ -225,12 +181,39 @@ func (c *policyController) handleErr(err error, key string) {
 	klog.Errorf("Dropping Policy %q out of the queue: %v", key, err)
 }
 
-func NewCalicoNetworkProvider() (NsNetworkPolicyProvider, error) {
-	// Get Calico client
-	calicoClient, err := client.NewFromEnv()
-	if err != nil {
-		return nil, err
+func NewK8sNetworkProvider(client kubernetes.Interface, npInformer informerv1.NetworkPolicyInformer) (NsNetworkPolicyProvider, error) {
+	c := &k8sPolicyController{
+		client:   client,
+		informer: npInformer,
+		ctx:      context.Background(),
 	}
 
-	return newPolicyController(context.Background(), calicoClient), nil
+	// Function returns map of policyName:policy stored by policy controller
+	// in datastore.
+	listFunc := func() (map[string]interface{}, error) {
+		// Get all policies from datastore
+		policies, err := npInformer.Lister().List(labels.Everything())
+		if err != nil {
+			return nil, err
+		}
+
+		// Filter in only objects that are written by policy controller.
+		m := make(map[string]interface{})
+		for _, policy := range policies {
+			policy.ObjectMeta = metav1.ObjectMeta{Name: policy.Name, Namespace: policy.Namespace}
+			k := c.GetKey(policy.Name, policy.Namespace)
+			m[k] = policy
+		}
+
+		klog.V(4).Infof("Found %d policies in k8s datastore:", len(m))
+		return m, nil
+	}
+
+	cacheArgs := rcache.ResourceCacheArgs{
+		ListFunc:   listFunc,
+		ObjectType: reflect.TypeOf(netv1.NetworkPolicy{}),
+	}
+	c.resourceCache = rcache.NewResourceCache(cacheArgs)
+
+	return c, nil
 }
